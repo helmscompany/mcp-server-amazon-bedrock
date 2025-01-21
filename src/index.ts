@@ -12,9 +12,12 @@ import { BedrockRuntimeClient, InvokeModelCommand } from "@aws-sdk/client-bedroc
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import { fromNodeProviderChain, fromIni } from "@aws-sdk/credential-providers";
 import { z } from "zod";
+import * as fs from 'fs';
+import * as path from 'path';
 
 const AWS_REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1';
 const AWS_PROFILE = process.env.AWS_PROFILE || 'default';
+const DEFAULT_OUTPUT_DIR = process.env.OUTPUT_DIR || '/workspaces/mcp-server-amazon-bedrock/output';
 
 // Log AWS configuration for debugging
 console.error('AWS Configuration:', {
@@ -78,7 +81,9 @@ const GenerateImageSchema = z.object({
   quality: z.enum(["standard", "premium"]).default("standard"),
   cfg_scale: z.number().min(1.1).max(10).default(6.5),
   seed: z.number().int().min(0).max(858993459).default(12),
-  numberOfImages: z.number().int().min(1).max(5).default(1)
+  numberOfImages: z.number().int().min(1).max(5).default(1),
+  outputDir: z.string().optional(),
+  filename: z.string().optional()
 }).refine(
   (data) => {
     // Check aspect ratio between 1:4 and 4:1
@@ -126,7 +131,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "generate_image",
-        description: "Generate image(s) using Amazon Nova Canvas model. The returned data is Base64-encoded string that represent each image that was generated.",
+        description: "Generate image(s) using Amazon Nova Canvas model and save to specified directory.",
         inputSchema: {
           type: "object",
           properties: {
@@ -163,6 +168,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "number",
               description: "Number of images to generate (1-5, default: 1)",
             },
+            outputDir: {
+              type: "string",
+              description: "Directory to save generated images (default: /workspaces/mcp-server-amazon-bedrock/output)",
+            },
+            filename: {
+              type: "string",
+              description: "Base filename for generated images (default: timestamp-based)",
+            },
           },
           required: ["prompt"],
         },
@@ -175,6 +188,15 @@ interface BedrockResponse {
   images: string[];
   error?: string;
 }
+
+/**
+ * Save a base64 encoded image to a file
+ */
+function saveBase64Image(base64Data: string, outputPath: string): void {
+  const imageData = Buffer.from(base64Data, 'base64');
+  fs.writeFileSync(outputPath, imageData);
+}
+
 /**
  * Handler for the generate_image tool.
  * Uses Amazon Bedrock to generate an image based on the provided parameters.
@@ -190,7 +212,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     // Validate and parse input
     const args = GenerateImageSchema.parse(request.params.arguments);
-    
+
+    // Ensure output directory exists
+    const outputDir = args.outputDir || DEFAULT_OUTPUT_DIR;
+    fs.mkdirSync(outputDir, { recursive: true });
+
     server.sendLoggingMessage({
       level: "info",
       data: `Configuration: ${JSON.stringify({
@@ -260,9 +286,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       );
     }
 
+    // Save images to files
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const baseFilename = args.filename || `${timestamp}-${args.prompt.slice(0, 30).replace(/[^a-z0-9]/gi, '-')}`;
+    const savedFiles: string[] = [];
+
+    responseBody.images.forEach((imageData, index) => {
+      const filename = `${baseFilename}-${index + 1}.png`;
+      const outputPath = path.join(outputDir, filename);
+      saveBase64Image(imageData, outputPath);
+      savedFiles.push(outputPath);
+    });
+
     server.sendLoggingMessage({
       level: "info",
-      data: "Successfully generated image",
+      data: `Successfully generated and saved ${savedFiles.length} images`,
     });
 
     // Return the response in the correct MCP format
@@ -270,16 +308,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content: [
         {
           type: "text",
-          text: `This is the image generated for your request '${args.prompt}'.`,
+          text: `Generated ${savedFiles.length} image(s) for prompt: '${args.prompt}'`,
         },
-        ...responseBody.images.map(image => ({
+        ...responseBody.images.map((image, index) => ({
           type: "image",
           data: image as string,
           mimeType: "image/png",
+          description: `Saved to: ${savedFiles[index]}`,
         })),
         {
           type: "text",
-          text: "This is the end of the image generation.",
+          text: `Images saved to: ${outputDir}`,
         }
       ],
     };
